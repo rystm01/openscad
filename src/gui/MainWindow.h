@@ -186,6 +186,7 @@ private slots:
   void actionNewWindow();
   void actionOpenWindow();
   void actionOpenRecent();
+  void actionSendChat();
   void actionOpenExample();
   void clearRecentFiles();
   void actionSave();

@@ -346,6 +346,9 @@ MainWindow::MainWindow(const QStringList& filenames)
   // Any code dependent on Preferences must come after the TabManager instantiation
   tabManager = new TabManager(this, filenames.isEmpty() ? QString() : filenames[0]);
   editorDockContents->layout()->addWidget(tabManager->getTabContent());
+    
+  // Make the chat panel visible by default
+  chat_panel->setVisible(true);
 
   connect(Preferences::inst(), SIGNAL(consoleFontChanged(const QString&,uint)), this->console, SLOT(setFont(const QString&,uint)));
 
@@ -591,6 +594,7 @@ MainWindow::MainWindow(const QStringList& filenames)
   connect(Preferences::inst(), SIGNAL(openCSGSettingsChanged()), this, SLOT(openCSGSettingsChanged()));
   connect(Preferences::inst(), SIGNAL(colorSchemeChanged(const QString&)), this, SLOT(setColorScheme(const QString&)));
   connect(Preferences::inst(), SIGNAL(toolbarExportChanged()), this, SLOT(updateExportActions()));
+  
 
   Preferences::inst()->apply_win(); // not sure if to be commented, checked must not be commented(done some changes in apply())
 
@@ -616,6 +620,7 @@ MainWindow::MainWindow(const QStringList& filenames)
   connect(this->replaceButton, SIGNAL(clicked()), this, SLOT(replace()));
   connect(this->replaceAllButton, SIGNAL(clicked()), this, SLOT(replaceAll()));
   connect(this->replaceInputField, SIGNAL(returnPressed()), this->replaceButton, SLOT(animateClick()));
+  connect(this->chatSendButton, SIGNAL(clicked()), this, SLOT(actionSendChat()));
   addKeyboardShortCut(this->viewerToolBar->actions());
   addKeyboardShortCut(this->editortoolbar->actions());
 
@@ -1423,6 +1428,169 @@ void MainWindow::clearRecentFiles()
   settings.setValue("recentFileList", files);
 
   updateRecentFileActions();
+}
+
+void MainWindow::actionSendChat() {
+  // Get the text from the chat input field
+  QString message = this->chatInputField->text();
+  if (!message.isEmpty()) {
+    // Show a loading indicator in the console
+    this->setCurrentOutput();
+    LOG("%s", "Sending request to Claude API...");
+    
+    // Create a network request to the Claude API
+    QUrl url("https://api.anthropic.com/v1/messages");
+    QNetworkRequest request(url);
+    
+    // Set headers for the Claude API
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    
+    // Get API key from the input field
+    QString apiKey = this->apiKeyField->text();
+    if (apiKey.isEmpty()) {
+      LOG(message_group::Error, "%s", "Claude API key is not set. Please enter it in the API Key field.");
+      this->chatInputField->clear();
+      return;
+    }
+    
+    request.setRawHeader("x-api-key", apiKey.toUtf8());
+    request.setRawHeader("anthropic-version", "2023-06-01");
+    
+    // Create the JSON payload
+    QJsonObject json;
+    QJsonObject thinkingJson;
+    json["model"] = "claude-3-7-sonnet-20250219";  // Use Claude 3 Haiku as fallback
+    json["max_tokens"] = 14000;
+
+
+    if(this->thinkingCheckBox->checkState()) {
+      thinkingJson["budget_tokens"] = 10000;
+      thinkingJson["type"] = "enabled";
+      json["thinking"] = thinkingJson;
+    }
+    
+    // Get current code for context
+    QString codeContext = this->activeEditor->toPlainText();
+    
+    // The Messages API accepts system as a top-level parameter, not as a message role
+    json["system"] = "You're an AI assistant specializing in OpenSCAD code. You'll help with debugging, improving, or creating OpenSCAD models. When asked to generate code, respond with properly formatted OpenSCAD code inside ```scad code blocks. Don't add explanations unless requested. Focus on creating clean, efficient, and well-structured OpenSCAD code.";
+    
+    // Create messages array with only user prompt
+    QJsonArray messages;
+    
+    // User message with code context and query
+    QJsonObject userMessage;
+    userMessage["role"] = "user";
+    
+    QString fullPrompt = QString("I'm working with this OpenSCAD code:\n\n```scad\n%1\n```\n\nMy question is: %2")
+                          .arg(codeContext)
+                          .arg(message);
+    
+    userMessage["content"] = fullPrompt;
+    messages.append(userMessage);
+    
+    json["messages"] = messages;
+    
+    QJsonDocument jsonDoc(json);
+    QByteArray jsonData = jsonDoc.toJson();
+    
+    // std::cout << jsonDoc << std::endl;
+    // std::cout << request << std::endl;
+    LOG("%s", "Sending request to Claude API...");
+    
+    // Create network manager and post request
+    QNetworkAccessManager *networkManager = new QNetworkAccessManager(this);
+    QNetworkReply *reply = networkManager->post(request, jsonData);
+    
+    // Connect signals for handling the response
+    connect(reply, &QNetworkReply::finished, [=]() {
+      
+      if (reply->error() == QNetworkReply::NoError) {
+        try {
+          // Parse the response
+
+          QJsonDocument responseDoc = QJsonDocument::fromJson(reply->readAll());
+          QJsonObject responseObj = responseDoc.object();
+          
+          if (responseObj.contains("content") && responseObj["content"].isArray()) {
+            QJsonArray contentArray = responseObj["content"].toArray();
+            
+            QString assistantResponse;
+            for (const QJsonValue &content : contentArray) {
+              QJsonObject contentObj = content.toObject();
+              if (contentObj["type"].toString() == "text") {
+                assistantResponse += contentObj["text"].toString();
+              }
+            }
+            
+            // Extract code blocks from the response
+            QRegularExpression codeBlockRegex("```(?:scad)?\\s*([\\s\\S]*?)```");
+            QRegularExpressionMatchIterator matches = codeBlockRegex.globalMatch(assistantResponse);
+            
+            QString codeToInsert;
+            if (matches.hasNext()) {
+              // Extract code from code blocks
+              while (matches.hasNext()) {
+                QRegularExpressionMatch match = matches.next();
+                codeToInsert += match.captured(1) + "\n";
+              }
+            } else {
+              // If no code blocks, use the whole response
+              codeToInsert = assistantResponse;
+            }
+            
+            // Replace editor content with the generated code
+            this->activeEditor->setText(codeToInsert);
+            
+            LOG("%s", "Replaced editor content with Claude API response");
+          } else if (responseObj.contains("content")) {
+            // Handle the response in the new API format
+            QString responseText = responseObj["content"].toObject()["text"].toString();
+            
+            // Extract code blocks from the response
+            QRegularExpression codeBlockRegex("```(?:scad)?\\s*([\\s\\S]*?)```");
+            QRegularExpressionMatchIterator matches = codeBlockRegex.globalMatch(responseText);
+            
+            QString codeToInsert;
+            if (matches.hasNext()) {
+              // Extract code from code blocks
+              while (matches.hasNext()) {
+                QRegularExpressionMatch match = matches.next();
+                codeToInsert += match.captured(1) + "\n";
+              }
+            } else {
+              // If no code blocks, use the whole response
+              codeToInsert = responseText;
+            }
+            
+            // Replace editor content with the generated code
+            this->activeEditor->setText(codeToInsert);
+            
+            LOG("%s", "Replaced editor content with Claude API response");
+          } else {
+            LOG(message_group::Error, "%s", "Invalid response format from Claude API");
+            LOG("%s", ("Response content: " + QString(reply->readAll()).toStdString()).c_str());
+          }
+        } catch (const std::exception& e) {
+          LOG(message_group::Error, "Failed to parse Claude API response: %s", e.what());
+          LOG("%s", ("Raw response: " + QString(reply->readAll()).toStdString()).c_str());
+        }
+      } else {
+        std::cout << reply->error() << std::endl;
+        std::cout << reply->errorString().toStdString().c_str() << std::endl;
+        std::cout << reply->readAll().toStdString() << std::endl;
+        LOG(message_group::Error, "Network error: %s", reply->errorString().toStdString().c_str());
+        LOG("%s", ("Response data: " + QString(reply->readAll()).toStdString()).c_str());
+        }
+      
+      // Clean up
+      reply->deleteLater();
+      networkManager->deleteLater();
+      
+      // Clear the input field after sending
+      this->chatInputField->clear();
+    });
+  }
 }
 
 void MainWindow::updateRecentFileActions()
